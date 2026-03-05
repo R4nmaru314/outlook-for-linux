@@ -1,183 +1,252 @@
-const { ipcMain, net, powerMonitor } = require('electron');
-const { LucidLog } = require('lucid-log');
+const { ipcMain, net, powerMonitor } = require("electron");
 
 let _ConnectionManager_window = new WeakMap();
 let _ConnectionManager_config = new WeakMap();
-let _ConnectionManager_logger = new WeakMap();
 let _ConnectionManager_currentUrl = new WeakMap();
+let _ConnectionManager_isRefreshing = new WeakMap();
+let _ConnectionManager_refreshTimeout = new WeakMap();
+let _ConnectionManager_boundRefresh = new WeakMap();
+let _ConnectionManager_boundDidFailLoad = new WeakMap();
+
 class ConnectionManager {
-	/**
-	 * @returns {Electron.BrowserWindow}
-	 */
-	get window() {
-		return _ConnectionManager_window.get(this);
-	}
+  get window() {
+    return _ConnectionManager_window.get(this);
+  }
 
-	/**
-	 * @returns {*}
-	 */
-	get config() {
-		return _ConnectionManager_config.get(this);
-	}
+  get config() {
+    return _ConnectionManager_config.get(this);
+  }
 
-	/**
-	 * @returns {LucidLog}
-	 */
-	get logger() {
-		return _ConnectionManager_logger.get(this);
-	}
+  get currentUrl() {
+    return _ConnectionManager_currentUrl.get(this);
+  }
 
-	/**
-	 * @returns {string}
-	 */
-	get currentUrl() {
-		return _ConnectionManager_currentUrl.get(this);
-	}
+  start(url, options) {
+    // Cleanup existing listeners before updating properties
+    // This ensures we clean up the old window's listeners, not the new one's
+    this.cleanup();
 
-	/**
-	 * @param {string} url
-	 * @param {{window:Electron.BrowserWindow,config:object}} options
-	 */
-	start(url, options) {
-		_ConnectionManager_window.set(this, options.window);
-		_ConnectionManager_config.set(this, options.config);
-		_ConnectionManager_logger.set(this, new LucidLog({
-			levels: options.config.appLogLevels.split(',')
-		}));
-		_ConnectionManager_currentUrl.set(this, url ? url : this.config.url);
-		ipcMain.on('offline-retry', assignOfflineRetryHandler(this));
-		powerMonitor.on('resume', assignSystemResumeEventHandler(this));
-		this.window.webContents.on('did-fail-load', assignOnDidFailLoadEventHandler(this));
-		this.refresh();
-	}
+    _ConnectionManager_window.set(this, options.window);
+    _ConnectionManager_config.set(this, options.config);
+    _ConnectionManager_currentUrl.set(this, url || this.config.url);
+    _ConnectionManager_isRefreshing.set(this, false);
+    _ConnectionManager_refreshTimeout.set(this, null);
 
-	async refresh() {
-		const currentUrl = this.window.webContents.getURL();
-		const hasUrl = currentUrl && currentUrl.startsWith('https://') ? true : false;
-		const connected = await this.isOnline(1000, 1);
-		if (!connected) {
-			this.window.setTitle('Waiting for network...');
-			this.logger.debug('Waiting for network...');
-		}
-		const retryConnected = connected || await this.isOnline(1000, 30);
-		if (retryConnected) {
-			if (hasUrl) {
-				this.window.reload();
-			} else {
-				this.window.loadURL(this.currentUrl, { userAgent: this.config.chromeUserAgent });
-			}
-		} else {
-			this.window.setTitle('No internet connection');
-			this.logger.error('No internet connection');
-		}
-	}
+    // Bind methods to preserve 'this' context
+    const boundRefresh = this.debouncedRefresh.bind(this);
+    const boundDidFailLoad = assignOnDidFailLoadEventHandler(this);
+    _ConnectionManager_boundRefresh.set(this, boundRefresh);
+    _ConnectionManager_boundDidFailLoad.set(this, boundDidFailLoad);
 
-	/**
-	 * @param {number} timeout 
-	 * @param {number} retries 
-	 * @returns 
-	 */
-	async isOnline(timeout, retries) {
-		const onlineCheckMethod = this.config.onlineCheckMethod;
-		var resolved = false;
-		for (var i = 1; i <= retries && !resolved; i++) {
-			resolved = await this.isOnlineTest(onlineCheckMethod, this.config.url);
-			if (!resolved) await sleep(timeout);
-		}
-		if (resolved) {
-			this.logger.debug('Network test successful with method ' + onlineCheckMethod);
-		} else {
-			this.logger.debug('Network test failed with method ' + onlineCheckMethod);
-		}
-		return resolved;
-	}
+    // Retry connection when user clicks retry button on offline page
+    ipcMain.on("offline-retry", boundRefresh);
+    powerMonitor.on("resume", boundRefresh);
+    this.window.webContents.on("did-fail-load", boundDidFailLoad);
 
-	async isOnlineTest(onlineCheckMethod, testUrl) {
-		switch (onlineCheckMethod) {
-		case 'none':
-			// That's more an escape gate in case all methods are broken, it disables
-			// the network test (assumes we're online).
-			this.logger.warn('Network test is disabled, assuming online status.');
-			return true;
-		case 'dns': {
-			// Sometimes too optimistic, might be false-positive where an HTTP proxy is
-			// mandatory but not reachable yet.
-			const testDomain = (new URL(testUrl)).hostname;
-			this.logger.debug('Testing network using net.resolveHost() for ' + testDomain);
-			return await isOnlineDns(testDomain);
-		}
-		case 'native':
-			// Sounds good but be careful, too optimistic in my experience; and at the contrary,
-			// might also be false negative where no DNS is available for internet domains, but
-			// an HTTP proxy is actually available and working.
-			this.logger.debug('Testing network using net.isOnline()');
-			return net.isOnline();
-		case 'https':
-		default:
-			// Perform an actual HTTPS request, similar to loading the Outlook app.
-			this.logger.debug('Testing network using net.request() for ' + testUrl);
-			return await isOnlineHttps(testUrl);
-		}
-	}
+    this.refresh();
+  }
+
+  cleanup() {
+    const boundRefresh = _ConnectionManager_boundRefresh.get(this);
+    const boundDidFailLoad = _ConnectionManager_boundDidFailLoad.get(this);
+
+    if (boundRefresh) {
+      ipcMain.removeListener("offline-retry", boundRefresh);
+      powerMonitor.removeListener("resume", boundRefresh);
+    }
+
+    if (boundDidFailLoad && this.isWindowAvailable() && this.window.webContents) {
+      this.window.webContents.removeListener("did-fail-load", boundDidFailLoad);
+    }
+
+    // Clear any pending debounce timeout
+    const timeout = _ConnectionManager_refreshTimeout.get(this);
+    if (timeout) {
+      clearTimeout(timeout);
+      _ConnectionManager_refreshTimeout.set(this, null);
+    }
+  }
+
+  debouncedRefresh() {
+    // Clear any existing timeout
+    const existingTimeout = _ConnectionManager_refreshTimeout.get(this);
+    if (existingTimeout) {
+      clearTimeout(existingTimeout);
+    }
+
+    // Set a new timeout to debounce rapid network change events
+    const timeout = setTimeout(() => {
+      _ConnectionManager_refreshTimeout.set(this, null);
+      this.refresh();
+    }, 1000); // Wait 1 second before actually refreshing
+
+    _ConnectionManager_refreshTimeout.set(this, timeout);
+  }
+
+  isWindowAvailable() {
+    return this.window && !this.window.isDestroyed();
+  }
+
+  async refresh() {
+    if (!this.isWindowAvailable()) {
+      console.warn("Window is not available. Cannot refresh.");
+      return;
+    }
+
+    // Prevent concurrent refresh operations
+    const isRefreshing = _ConnectionManager_isRefreshing.get(this);
+    if (isRefreshing) {
+      console.debug("Refresh already in progress, skipping...");
+      return;
+    }
+
+    try {
+      _ConnectionManager_isRefreshing.set(this, true);
+
+      const currentUrl = this.window?.webContents?.getURL() || "";
+      const hasUrl = currentUrl?.startsWith("https://");
+      this.window?.setTitle("Waiting for network...");
+      console.debug("Waiting for network...");
+      const connected = await this.isOnline();
+
+      // Re-check window availability after async isOnline() call,
+      // as the window may have been destroyed during the network check
+      if (!this.isWindowAvailable()) {
+        console.warn("[CONNECTION] Window was destroyed during network check. Aborting refresh.");
+        return;
+      }
+
+      if (connected) {
+        if (hasUrl) {
+          console.debug("Reloading current page...");
+          try {
+            this.window.reload();
+          } catch (err) {
+            console.error(`[CONNECTION] Failed to reload page: ${err.message}`);
+            this.debouncedRefresh();
+          }
+        } else {
+          console.debug("Loading initial URL...");
+          try {
+            await this.window.loadURL(this.currentUrl, {
+              userAgent: this.config.chromeUserAgent,
+            });
+          } catch (err) {
+            console.error(`[CONNECTION] Failed to load URL: ${err.message}`);
+            this.debouncedRefresh();
+          }
+        }
+      } else {
+        this.window?.setTitle("No internet connection");
+        console.error("No internet connection");
+      }
+    } finally {
+      _ConnectionManager_isRefreshing.set(this, false);
+    }
+  }
+
+  async isOnline() {
+    const onlineCheckMethods = [
+      {
+        // Perform an actual HTTPS request, similar to loading the Teams app.
+        method: "https",
+        tries: 10,
+        networkTest: async () => {
+          return await isOnlineHttps(this.config.url);
+        },
+      },
+      {
+        // Sometimes too optimistic, might be false-positive where an HTTP proxy is
+        // mandatory but not reachable yet.
+        method: "dns",
+        tries: 5,
+        networkTest: async () => {
+          const testDomain = new URL(this.config.url).hostname;
+          return await isOnlineDns(testDomain);
+        },
+      },
+      {
+        // Sounds good but be careful, too optimistic in my experience; and at the contrary,
+        // might also be false negative where no DNS is available for internet domains, but
+        // an HTTP proxy is actually available and working.
+        method: "native",
+        tries: 5,
+        networkTest: async () => {
+          return net.isOnline();
+        },
+      },
+      {
+        // That's more an escape gate in case all methods are broken, it disables
+        // the network test (assumes we're online).
+        method: "none",
+        tries: 1,
+        networkTest: async () => {
+          console.warn("Network test is disabled, assuming online.");
+          return true;
+        },
+      },
+    ];
+
+    for (const onlineCheckMethod of onlineCheckMethods) {
+      for (let i = 1; i <= onlineCheckMethod.tries; i++) {
+        const online = await onlineCheckMethod.networkTest();
+        if (online) {
+          return true;
+        }
+        await sleep(500);
+      }
+    }
+    return false;
+  }
 }
 
-/**
- * 
- * @param {ConnectionManager} cm 
- */
-function assignOfflineRetryHandler(cm) {
-	return () => {
-		cm.refresh();
-	};
-}
+const { NETWORK_ERROR_PATTERNS } = require("../config/defaults");
 
-/**
- * @param {ConnectionManager} cm 
- */
-function assignSystemResumeEventHandler(cm) {
-	return () => {
-		cm.refresh();
-	};
-}
+// Network errors that should trigger an automatic reconnection attempt.
+// These cover disconnections, network changes, and proxy/tunnel failures.
+const RECOVERABLE_NETWORK_ERRORS = new Set(NETWORK_ERROR_PATTERNS);
 
-/**
- * @param {ConnectionManager} cm 
- */
 function assignOnDidFailLoadEventHandler(cm) {
-	return (event, code, description) => {
-		cm.logger.error(description);
-		if (description === 'ERR_INTERNET_DISCONNECTED' || description === 'ERR_NETWORK_CHANGED') {
-			cm.refresh();
-		}
-	};
+  return (event, code, description) => {
+    console.error(
+      `assignOnDidFailLoadEventHandler : ${JSON.stringify(
+        event
+      )} - ${code} - ${description}`
+    );
+    if (RECOVERABLE_NETWORK_ERRORS.has(description)) {
+      console.debug(`Network error detected: ${description}, scheduling debounced refresh...`);
+      cm.debouncedRefresh();
+    }
+  };
 }
 
 function sleep(timeout) {
-	return new Promise(r => setTimeout(r, timeout));
+  return new Promise((r) => setTimeout(r, timeout));
 }
 
 function isOnlineHttps(testUrl) {
-	return new Promise((resolve) => {
-		var req = net.request({
-			url: testUrl,
-			method: 'HEAD'
-		});
-		req.on('response', () => {
-			resolve(true);
-		});
-		req.on('error', () => {
-			resolve(false);
-		});
-		req.end();
-	});
+  return new Promise((resolve) => {
+    const req = net.request({
+      url: testUrl,
+      method: "HEAD",
+    });
+    req.on("response", () => {
+      resolve(true);
+    });
+    req.on("error", () => {
+      resolve(false);
+    });
+    req.end();
+  });
 }
 
 function isOnlineDns(testDomain) {
-	return new Promise((resolve) => {
-		net.resolveHost(testDomain)
-			.then(() => resolve(true))
-			.catch(() => resolve(false));
-	});
+  return new Promise((resolve) => {
+    net
+      .resolveHost(testDomain)
+      .then(() => resolve(true))
+      .catch(() => resolve(false));
+  });
 }
 
-module.exports = new ConnectionManager();
+module.exports = ConnectionManager;
