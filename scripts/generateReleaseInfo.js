@@ -41,14 +41,15 @@ async function generateReleaseInfo(projectRoot = null) {
     );
   }
 
-  // Load com.github.IsmaelMartinez.teams_for_linux.appdata.xml
-  const appdataPath = path.join(
+  // Load appdata.xml (supports both Outlook and Teams for Linux)
+  let appdataPath = path.join(
     root,
-    "com.github.IsmaelMartinez.teams_for_linux.appdata.xml"
+    "com.github.r4nmaru.outlook_for_linux.appdata.xml"
   );
+
   if (!fs.existsSync(appdataPath)) {
     throw new Error(
-      "com.github.IsmaelMartinez.teams_for_linux.appdata.xml not found."
+      "No appdata.xml found. Expected com.github.r4nmaru.outlook_for_linux.appdata.xml"
     );
   }
   const appdataContent = fs.readFileSync(appdataPath, "utf8");
@@ -72,7 +73,7 @@ async function generateReleaseInfo(projectRoot = null) {
   const matchingRelease = releases.find((rel) => rel.$.version === baseVersion);
   if (!matchingRelease) {
     throw new Error(
-      `No release entry found for version ${baseVersion} in com.github.IsmaelMartinez.teams_for_linux.appdata.xml. Please add a release entry for this version.`
+      `No release entry found for version ${baseVersion} in appdata.xml. Please add a release entry for this version.`
     );
   }
 
